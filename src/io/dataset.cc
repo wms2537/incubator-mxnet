@@ -39,6 +39,8 @@
 #include "../imperative/naive_cached_op.h"
 #include "../ndarray/ndarray_function.h"
 
+#include "./dctfromjpg.h"
+
 #if MXNET_USE_OPENCV
 #include <opencv2/opencv.hpp>
 #include "./opencv_compatibility.h"
@@ -185,6 +187,155 @@ struct IRHeader {
   uint64_t id;
   uint64_t id2;
 };  // struct IRHeader
+
+struct DCTRecordFileDatasetParam : public dmlc::Parameter<DCTRecordFileDatasetParam> {
+  std::string rec_file;
+  std::string idx_file;
+  bool normalize;
+  int channels;
+  int size;
+  // declare parameters
+  DMLC_DECLARE_PARAMETER(DCTRecordFileDatasetParam) {
+      DMLC_DECLARE_FIELD(rec_file)
+          .describe("The absolute path of record file.");
+      DMLC_DECLARE_FIELD(idx_file)
+          .describe("The path of the idx file.");
+      DMLC_DECLARE_FIELD(size)
+          .describe("Output size.");
+      DMLC_DECLARE_FIELD(normalize)
+          .set_default(3)
+          .describe("Normalize with quantification tables.");
+      DMLC_DECLARE_FIELD(channels)
+          .set_lower_bound(1)
+          .set_default(3)
+          .describe("Number of channels in input image.");
+  }
+};  // struct RecordFileDatasetParam
+
+DMLC_REGISTER_PARAMETER(DCTRecordFileDatasetParam);
+
+class DCTRecordFileDataset final : public Dataset {
+public:
+  explicit DCTRecordFileDataset(const std::vector<std::pair<std::string, std::string> >& kwargs) {
+    std::vector<std::pair<std::string, std::string> > kwargs_left;
+    param_.InitAllowUnknown(kwargs);
+    base_ = std::make_shared<RecordFileDataset>(kwargs);
+  }
+
+  uint64_t GetLen() const override {
+    return base_->GetLen();
+  }
+
+  bool GetItem(uint64_t idx, std::vector<NDArray> *ret) override {
+    CHECK_LT(idx, GetLen());
+    std::vector<NDArray> raw;
+    if (!base_->GetItem(idx, &raw))
+      return false;
+    CHECK_EQ(raw.size(), 1U) << "RecordFileDataset should return size 1 NDArray vector";
+    uint8_t *s = reinterpret_cast<uint8_t *>(raw[0].data().dptr_);
+    size_t size = raw[0].shape().Size();
+    CHECK_GT(size, sizeof(IRHeader)) << "Invalid size of bytes from Record File";
+    IRHeader header;
+    std::memcpy(&header, s, sizeof(header));
+    size -= sizeof(header);
+    s += sizeof(header);
+    NDArray label = NDArray(Context::CPU(), mshadow::default_type_flag);
+    RunContext rctx{Context::CPU(), nullptr, nullptr, false};
+    if (header.flag > 0)
+    {
+      auto label_shape = header.flag <= 1 ? TShape(0, 1) : TShape({header.flag});
+      label.ReshapeAndAlloc(label_shape);
+      TBlob dst = label.data();
+      mxnet::ndarray::Copy<cpu, cpu>(
+          TBlob(reinterpret_cast<void *>(s), label.shape(), cpu::kDevMask, label.dtype(), 0),
+          &dst, Context::CPU(), Context::CPU(), rctx);
+      s += sizeof(float) * header.flag;
+      size -= sizeof(float) * header.flag;
+    }
+    else
+    {
+      // label is a scalar with ndim() == 0
+      label.ReshapeAndAlloc(TShape(0, 1));
+      TBlob dst = label.data();
+      *(dst.dptr<float>()) = header.label;
+    }
+    ret->resize(4);
+    (*ret)[3] = label;
+#if MXNET_USE_OPENCV
+    jpeg2dct::common::band_info bands[3];
+    try {
+      jpeg2dct::common::read_dct_coefficients_from_buffer_(
+          (char*)s, size, param_.normalize,
+          (int)param_.channels, &bands[0], &bands[1], &bands[2]);
+    } catch (std::runtime_error &e) {
+      LOG(FATAL) << e.what();
+      return false;
+    }
+    (*ret)[0] = NDArray(mshadow::Shape3(
+                param_.size, param_.size, bands[0].dct_b),
+            Context::CPU(), false, mshadow::kInt16);
+    const int cv_type = CV_MAKETYPE(CV_16S, bands[0].dct_b);
+    cv::Mat buf(bands[0].dct_h, bands[0].dct_w, cv_type, bands[0].dct);
+    cv::Mat dst(param_.size, param_.size, cv_type, (*ret)[0].data().dptr_);
+    cv::resize(buf, dst, cv::Size(param_.size, param_.size), 0, 0, 1);
+    CHECK(!dst.empty());
+    CHECK_EQ(static_cast<void *>(dst.ptr()), (*ret)[0].data().dptr_);
+    delete[] bands[0].dct;
+    if(param_.channels > 1) {
+      (*ret)[1] = NDArray(mshadow::Shape3(
+                  param_.size, param_.size, bands[1].dct_b),
+              Context::CPU(), false, mshadow::kInt16);
+      const int cv_type = CV_MAKETYPE(CV_16S, bands[1].dct_b);
+      cv::Mat buf(bands[1].dct_h, bands[1].dct_w, cv_type, bands[1].dct);
+      cv::Mat dst(param_.size, param_.size, cv_type, (*ret)[1].data().dptr_);
+      cv::resize(buf, dst, cv::Size(param_.size, param_.size), 0, 0, 1);
+      CHECK(!dst.empty());
+      CHECK_EQ(static_cast<void *>(dst.ptr()), (*ret)[1].data().dptr_);
+      delete[] bands[1].dct;
+    }
+    if(param_.channels > 2) {
+      (*ret)[2] = NDArray(mshadow::Shape3(
+                  param_.size, param_.size, bands[2].dct_b),
+              Context::CPU(), false, mshadow::kInt16);
+      const int cv_type = CV_MAKETYPE(CV_16S, bands[2].dct_b);
+      cv::Mat buf(bands[2].dct_h, bands[2].dct_w, cv_type, bands[2].dct);
+      cv::Mat dst(param_.size, param_.size, cv_type, (*ret)[2].data().dptr_);
+      cv::resize(buf, dst, cv::Size(param_.size, param_.size), 0, 0, 1);
+      CHECK(!dst.empty());
+      CHECK_EQ(static_cast<void *>(dst.ptr()), (*ret)[2].data().dptr_);
+      delete[] bands[2].dct;
+    }
+    // cv::Mat buf(1, size, CV_16S, s);
+    // cv::Mat res = cv::imdecode(buf, param_.flag);
+    // CHECK(!res.empty()) << "Decoding failed. Invalid image file.";
+    // const int n_channels = res.channels();
+    // if (n_channels == 1) {
+    //   SwapImageChannels<1>(res, &(ret->at(0)));
+    // } else if (n_channels == 3) {
+    //   SwapImageChannels<3>(res, &(ret->at(0)));
+    // } else if (n_channels == 4) {
+    //   SwapImageChannels<4>(res, &(ret->at(0)));
+    // }
+    return true;
+#else
+  LOG(FATAL) << "Opencv is needed for image decoding.";
+#endif
+  return false;  // should not reach here
+  }
+
+private:
+  /*! \brief parameters */
+  DCTRecordFileDatasetParam param_;
+  /*! \brief base recordIO reader */
+  std::shared_ptr<RecordFileDataset> base_;
+};
+
+MXNET_REGISTER_IO_DATASET(DCTRecordFileDataset)
+    .describe("MXNet Record File Dataset")
+    .add_arguments(DCTRecordFileDatasetParam::__FIELDS__())
+    .set_body([](const std::vector<std::pair<std::string, std::string>> &kwargs) {
+      return new DCTRecordFileDataset(kwargs);
+    });
 
 class ImageRecordFileDataset : public Dataset {
  public:
